@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b0f14">
+<title>K Pad 调频</title>
+<style>
+:root{
+  color-scheme:dark;
+  --bg:#0b0f14; --card:#141a22; --card2:#1a222c; --line:#243040;
+  --txt:#e8eef6; --dim:#8b9bb0; --dim2:#5d6d80;
+  --acc:#3ee0c5; --c0:#4da3ff; --c1:#b07bff; --c2:#ff7a6b; --gpu:#ffb648;
+  --warn:#ff9f43; --bad:#ff5d5d;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{
+  margin:0;background:var(--bg);color:var(--txt);
+  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Noto Sans CJK SC",system-ui,sans-serif;
+  font-size:15px;line-height:1.45;font-variant-numeric:tabular-nums;
+  padding:calc(env(safe-area-inset-top,0px) + 14px) 14px calc(env(safe-area-inset-bottom,0px) + 30px);
+  max-width:560px;margin:0 auto;
+}
+.hd{display:flex;align-items:center;gap:10px;margin-bottom:14px}
+.hd h1{font-size:17px;font-weight:650;margin:0}
+.hd .dot{width:7px;height:7px;border-radius:50%;background:var(--dim2);flex:none;transition:.3s}
+.hd .dot.on{background:var(--acc);box-shadow:0 0 8px rgba(62,224,197,.7)}
+.hd .st{font-size:11px;color:var(--dim2);margin-left:auto}
+
+.cl{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:13px 14px;margin-bottom:10px}
+.cl .top{display:flex;align-items:baseline;gap:8px}
+.cl .nm{font-size:12.5px;color:var(--dim);font-weight:600}
+.cl .cpus{font-size:10.5px;color:var(--dim2);margin-left:auto}
+.cl .val{font-size:25px;font-weight:680;letter-spacing:-.3px;margin-top:2px}
+.cl .val small{font-size:12px;color:var(--dim);font-weight:500;margin-left:3px}
+.cl .rng{font-size:11.5px;color:var(--dim2);margin-top:1px}
+.bar{position:relative;height:5px;border-radius:3px;background:#1e2733;margin-top:9px;overflow:visible}
+.bar i{position:absolute;left:0;top:0;bottom:0;border-radius:3px;opacity:.5}
+.bar b{position:absolute;top:-2.5px;width:3px;height:10px;border-radius:2px;transform:translateX(-1.5px)}
+.k0 .val{color:var(--c0)} .k0 .bar i,.k0 .bar b{background:var(--c0)}
+.k1 .val{color:var(--c1)} .k1 .bar i,.k1 .bar b{background:var(--c1)}
+.k2 .val{color:var(--c2)} .k2 .bar i,.k2 .bar b{background:var(--c2)}
+.gp .val{color:var(--gpu)} .gp .bar i,.gp .bar b{background:var(--gpu)}
+.pw .val{color:var(--acc)} .pw .bar i,.pw .bar b{background:var(--acc)}
+
+.sec{font-size:12px;color:var(--dim);font-weight:600;margin:18px 0 9px;display:flex;align-items:center;gap:7px}
+.sec .badge{display:none;font-size:10px;color:var(--acc);background:rgba(62,224,197,.14);padding:1px 7px;border-radius:8px}
+.sec .badge.on{display:inline-block}
+
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.prof{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:11px 12px;text-align:left;color:var(--txt);font-family:inherit;transition:.16s;cursor:pointer}
+.prof:active{transform:scale(.97)}
+.prof .n{font-size:14px;font-weight:640;display:block}
+.prof .d{font-size:10.5px;color:var(--dim2);display:block;margin-top:3px;line-height:1.35}
+.prof.on{border-color:var(--acc);background:rgba(62,224,197,.08)}
+.prof.on .n{color:var(--acc)}
+
+.row{display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:11px 13px;margin-bottom:9px}
+.row .t{font-size:13px}
+.row .s{font-size:11px;color:var(--dim2)}
+.row .sp{margin-left:auto}
+
+.sw{width:46px;height:26px;border-radius:13px;background:#26313f;position:relative;transition:.2s;border:none;padding:0;cursor:pointer;flex:none}
+.sw::after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:#7d8ea3;transition:.2s}
+.sw.on{background:rgba(62,224,197,.3)}
+.sw.on::after{left:23px;background:var(--acc)}
+
+.chips{display:flex;flex-wrap:wrap;gap:8px}
+.chip{width:calc(25% - 6px);background:var(--card);border:1px solid var(--line);border-radius:11px;padding:9px 0;text-align:center;font-size:12.5px;color:var(--dim);font-family:inherit;cursor:pointer;transition:.15s}
+.chip.on{color:var(--txt);border-color:rgba(77,163,255,.55);background:rgba(77,163,255,.1)}
+.chip.no{opacity:.45}
+.chip.lock{cursor:not-allowed}
+/* 刷新率 5 个档一排放得下(通用 .chip 是 4 列, 会掉到第二行) */
+#rrs .chip{width:calc(20% - 7px);font-size:12px;padding:9px 0}
+#rrs .chip small{font-size:9px;opacity:.55;margin-left:1px}
+/* 刷新率 5 个档一排放得下(通用 .chip 是 4 列, 会掉到第二行) */
+#rrs .chip{width:calc(20% - 7px);font-size:12px;padding:9px 0}
+#rrs .chip small{font-size:9px;opacity:.55;margin-left:1px}
+
+.rngt{width:100%;accent-color:var(--gpu);height:26px}
+.foot{font-size:10.5px;color:var(--dim2);margin-top:20px;line-height:1.6}
+.toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,20px);background:#1d2733;border:1px solid var(--line);color:var(--txt);
+  font-size:12.5px;padding:9px 15px;border-radius:10px;opacity:0;transition:.25s;pointer-events:none;max-width:86vw;text-align:center;z-index:9}
+.toast.on{opacity:1;transform:translate(-50%,0)}
+</style>
+</head>
+<body>
+
+<div class="hd">
+  <div class="dot" id="dot"></div>
+  <h1>K Pad 调频</h1>
+  <div class="st" id="st">连接中…</div>
+</div>
+
+<div id="clusters"></div>
+<div id="gpuCard"></div>
+<div id="pwCard"></div>
+
+<div class="sec">档位</div>
+<div class="grid" id="profs"></div>
+
+<div class="sec">自动维持 <span class="badge" id="wb">守护中</span></div>
+<div class="row">
+  <div><div class="t">频率守护</div><div class="s" id="wtxt">关闭时不自动维持，系统可自行改频</div></div>
+  <button class="sw" id="wsw"></button>
+</div>
+<div class="row">
+  <div><div class="t">温度让权上限</div><div class="s" id="ltxt">—</div></div>
+  <div class="sp" style="display:flex;gap:6px">
+    <button class="chip" style="width:44px" onclick="setTemp(-5)">-5</button>
+    <button class="chip" style="width:44px" onclick="setTemp(5)">+5</button>
+  </div>
+</div>
+
+<div class="sec">状态栏 HUD <span class="badge" id="hudb">已关闭</span></div>
+<div class="row">
+  <div><div class="t">HUD 采样</div><div class="s" id="hudtxt">常驻通知实时显示 CPU/GPU/温度/功耗/帧率</div></div>
+  <button class="sw" id="hudsw"></button>
+</div>
+<div class="row">
+  <div><div class="t">采样间隔</div><div class="s" id="hudivtxt">—</div></div>
+  <div class="sp" style="display:flex;gap:6px">
+    <button class="chip" style="width:44px" onclick="setHudIv(-1)">-1</button>
+    <button class="chip" style="width:44px" onclick="setHudIv(1)">+1</button>
+  </div>
+</div>
+
+<div class="sec">屏幕刷新率 <span class="badge" id="rrb">—</span></div>
+<div class="chips" id="rrs"></div>
+<div class="row">
+  <div><div class="t">锁死上限</div><div class="s">开启后连你手动改的也会被顶回去；想临时降刷新率要先关掉</div></div>
+  <button class="sw" id="rrlsw"></button>
+</div>
+
+<div class="sec">GPU 档位</div>
+<div class="row" style="display:block">
+  <div style="display:flex"><div class="t">频率上限</div><div class="s sp" id="glab">—</div></div>
+  <input class="rngt" id="grng" type="range" min="0" max="49" value="0">
+</div>
+
+<div class="sec">核心开关</div>
+<div class="chips" id="cores"></div>
+
+<div class="foot" id="foot"></div>
+<div class="toast" id="toast"></div>
+
+<script>
+var D=null, busy=false, dragging=false;
+
+function $(id){return document.getElementById(id)}
+function toast(m){var t=$('toast');t.textContent=m;t.classList.add('on');clearTimeout(t._h);t._h=setTimeout(function(){t.classList.remove('on')},1800)}
+function api(q){return fetch('cgi-bin/api.cgi?'+q+'&_='+Date.now(),{cache:'no-store'}).then(function(r){return r.json()})}
+function mhz(k){return Math.round(k/1000)}
+function ghz(k){var m=k/1000;return m>=1000?(m/1000).toFixed(2)+' GHz':m.toFixed(0)+' MHz'}
+function t(t){if(!t)return'—';return (t/1000).toFixed(1)+'℃'}
+function esc(s){return String(s==null?'':s).replace(/[<>&]/g,function(c){return{'<':'&lt;','>':'&gt;','&':'&amp;'}[c]})}
+
+function act(q,silent){
+  if(busy)return Promise.resolve();
+  busy=true;
+  return api(q).then(function(r){
+    if(!silent&&r&&r.msg)toast(r.msg);
+    return load();
+  }).catch(function(){toast('操作失败')}).then(function(){busy=false});
+}
+
+function load(){
+  return api('action=state').then(function(d){
+    D=d; render();
+    $('dot').classList.add('on');
+    $('st').textContent=d.watch?'守护中 · '+t(d.temp):t(d.temp);
+  }).catch(function(){$('dot').classList.remove('on');$('st').textContent='连接失败'});
+}
+
+function bar(pctMin,pctMax,curPct){
+  return '<div class="bar"><i style="width:'+Math.max(1,pctMax)+'%"></i>'+
+         '<b style="left:'+Math.min(99,Math.max(1,curPct))+'%"></b></div>';
+}
+
+function render(){
+  var d=D;
+  // 簇
+  var h='';
+  d.clusters.forEach(function(c,i){
+    var av=c.avail||[], top=av.length?av[0]:(c.max||1), low=av.length?av[av.length-1]:(c.min||1);
+    var span=Math.max(1,top-low);
+    var pMin=(c.min-low)/span*100, pMax=(c.max-low)/span*100, pCur=(c.cur-low)/span*100;
+    var ceilNote=c.ceil&&c.ceil>0?('· 当前天花板 '+ghz(c.ceil)):'';
+    h+='<div class="cl k'+i+'">'+
+       '<div class="top"><span class="nm">'+esc(c.name)+'</span><span class="cpus">cpu '+esc(c.cpus)+'</span></div>'+
+       '<div class="val">'+ghz(c.max)+'<small>上限</small></div>'+
+       '<div class="rng">'+ghz(c.min)+' – '+ghz(c.max)+' · 实时 '+ghz(c.cur)+' '+ceilNote+'</div>'+
+       bar(pMin,pMax,pCur)+'</div>';
+  });
+  $('clusters').innerHTML=h;
+
+  // GPU
+  var g=d.gpu;
+  $('gpuCard').innerHTML='<div class="cl gp">'+
+    '<div class="top"><span class="nm">GPU (Mali)</span><span class="cpus">'+esc(d.gpu.count)+' 档</span></div>'+
+    '<div class="val">'+(g.maxMhz||0)+'<small>MHz 上限</small></div>'+
+    '<div class="rng">档位 '+g.level+' · '+(g.curIsCap?'上限 ≤':'实时 ')+g.curMhz+' MHz · 顶峰 '+g.topMhz+' MHz · 占用 '+(g.busyPct||0)+'% · '+t(d.gpuTemp)+'</div>'+
+    '</div>';
+
+  // 功耗
+  var p=d.power;
+  var mw=p.mw||0, watts=(mw/1000);
+  $('pwCard').innerHTML='<div class="cl pw">'+
+    '<div class="top"><span class="nm">'+(p.st==='Charging'?'充电中':p.st==='Discharging'?'放电中':p.st==='Full'?'已充满':'供电')+'</span>'+
+    '<span class="cpus">电池 '+t(d.battTemp)+'</span></div>'+
+    '<div class="val">'+watts.toFixed(2)+'<small>W</small></div>'+
+    '<div class="rng">'+(p.mv/1000).toFixed(2)+'V × '+p.ma+'mA</div>'+
+    bar(0,Math.min(100,mw/300),Math.min(100,mw/300))+'</div>';
+
+  // 档位
+  var ph='';
+  d.profiles.forEach(function(pr){
+    ph+='<button class="prof'+(pr.k===d.profile?' on':'')+'" data-k="'+pr.k+'">'+
+        '<span class="n">'+esc(pr.n)+'</span><span class="d">'+esc(pr.d)+'</span></button>';
+  });
+  $('profs').innerHTML=ph;
+  Array.prototype.forEach.call($('profs').children,function(b){
+    b.onclick=function(){act('action=apply&profile='+b.dataset.k)};
+  });
+
+  // 守护
+  $('wsw').className='sw'+(d.watch?' on':'');
+  $('wsw').onclick=function(){act('action=watch&value='+(d.watch?0:1))};
+  $('wb').className='badge'+(d.watch?' on':'');
+
+  // 温度
+  $('ltxt').textContent='达到 '+(d.limit/1000).toFixed(0)+'℃ 时让权给系统温控';
+
+  // HUD
+  $('hudsw').className='sw'+(d.hud?' on':'');
+  $('hudsw').onclick=function(){act('action=hud&value='+(d.hud?0:1))};
+  $('hudb').className='badge'+(d.hud?' on':'');
+  $('hudb').textContent=d.hud?'运行中':'已关闭';
+  $('hudivtxt').textContent='每 '+(d.hudInterval||5)+' 秒采样一次';
+
+  // 刷新率(本机面板支持 60/90/120/144/165; 静止时 LTPO 会自己降到 48/50, 属正常)
+  if(d.refresh){
+    var RRS=[60,90,120,144,165], rrh='';
+    RRS.forEach(function(hz){
+      rrh+='<button class="chip'+(hz===d.refresh.cur?' on':'')+'" data-hz="'+hz+'">'+hz+'<small>Hz</small></button>';
+    });
+    $('rrs').innerHTML=rrh;
+    Array.prototype.forEach.call($('rrs').children,function(b){
+      b.onclick=function(){act('action=refresh&value='+b.dataset.hz)};
+    });
+    $('rrb').textContent=d.refresh.cur+' Hz'+(d.refresh.dyn?' · 实时 '+d.refresh.dyn:'');
+    $('rrlsw').className='sw'+(d.refresh.lock?' on':'');
+    $('rrlsw').onclick=function(){act('action=refresh_lock&value='+(d.refresh.lock?0:1))};
+  }
+
+  // GPU 滑块
+  var r=$('grng');
+  r.max=g.count-1;
+  if(!dragging)r.value=g.level;
+  $('glab').textContent='档位 '+g.level+' → '+g.maxMhz+' MHz';
+  r.oninput=function(){$('glab').textContent='档位 '+r.value+' → 松手生效';};
+  r.onchange=function(){act('action=gpu&level='+r.value);dragging=false};
+  r.onpointerdown=function(){dragging=true};
+
+  // 核心
+  var ch='';
+  d.cores.forEach(function(v,i){
+    var cls='chip'+(v?' on':'')+(i===0?' lock no':'');
+    ch+='<button class="'+cls+'" data-i="'+i+'">cpu'+i+'</button>';
+  });
+  $('cores').innerHTML=ch;
+  Array.prototype.forEach.call($('cores').children,function(b){
+    var i=+b.dataset.i;
+    if(i===0)return;
+    b.onclick=function(){act('action=core&cpu='+i+'&value='+(d.cores[i]?0:1))};
+  });
+
+  $('foot').innerHTML='天花板会随温度浮动（MTK 限制器），档位按当前天花板实时换算，所以同一档在不同温度下实际频率可能不同。'+
+    '<br>model: REDMI K Pad / turner · 温度上限 '+(d.limit/1000)+'℃';
+}
+
+function setTemp(delta){
+  if(!D)return;
+  var v=D.limit+delta*1000;
+  if(v<45000)v=45000; if(v>85000)v=85000;
+  act('action=temp_limit&value='+v);
+}
+
+function setHudIv(delta){
+  if(!D)return;
+  var v=(D.hudInterval||5)+delta;
+  if(v<1)v=1; if(v>30)v=30;
+  act('action=hud_interval&value='+v);
+}
+
+load();
+setInterval(function(){if(!busy&&!dragging)load()},3000);
+</script>
+</body>
+</html>

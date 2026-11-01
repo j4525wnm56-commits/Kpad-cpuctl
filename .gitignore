@@ -1,0 +1,17 @@
+# 打包产物
+*.zip
+dist/
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 截图（会暴露状态栏里的第三方应用通知图标，需要打码后才考虑入库）
+*.png
+*.jpg
+*.jpeg
+
+# 签名密钥
+*.jks
+*.keystore

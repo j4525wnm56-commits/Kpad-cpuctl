@@ -1,0 +1,7 @@
+id=kpad_cpuctl
+name=K Pad 调频 (CPU+GPU)
+version=v1.3.0-hud
+versionCode=4
+author=Langrm
+description=REDMI K Pad (turner / Dimensity 9400+) 的 CPU/GPU 频率档位管理。v1.3.0 解锁 165Hz: 本机面板支持 60/90/120/144/165, 但出厂把三个刷新率键都压在 120(system/peak_refresh_rate + secure/user_refresh_rate + secure/miui_refresh_rate, 少写一个会被另一个拉回去)。新增 cpuctl refresh 子命令: 可设 48~165 上限、查看 SF/面板当前值、auto 还原出厂; 附可选 refresh lock 守护(默认关闭): 开了就把上限锁死, 连你手动改的也顶回去, 适合"不想再被任何东西改回去"的场景; 不做无限拉锯, 60 秒内纠正超过 6 次即停手留标记。另修 service.sh 自启悬浮窗的类名错误(写成 $PKG/.HudService 会解析到不存在的类, 静默失败)。v1.2.0 的 HUD 重做(三簇/GPU上限标注/TEMP双槽/功率单位修复/fpsgo)全部保留。
+updateJson=

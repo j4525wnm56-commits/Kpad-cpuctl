@@ -1,0 +1,1363 @@
+#!/system/bin/sh
+# K Pad 调频 — REDMI K Pad (turner / Dimensity 9400+) CPU + GPU 频率管理
+#
+# 移植自骁龙平台(SM8850)的同款实现。原版把平台差异写死在代码里:
+#   CPU   : policy0(cpu0-5) + policy6(cpu6-7) 两簇, 频点是 kHz 绝对值
+#   GPU   : /sys/class/kgsl/kgsl-3d0 (Adreno), pwrlevel 0-17
+#   Governor: walt
+#   thermal : cpu-[01]-* 热区
+# 本机(MTK mt6991 + Mali)全都不一样, 所以改成运行时发现:
+#   CPU   : policy0(cpu0-3) + policy4(cpu4-6) + policy7(cpu7) 三簇, 驱动 mtk-cpufreq-hw
+#   GPU   : /sys/class/devfreq/48000000.mali (Mali-G925), 49 档 + cooling_device 限频
+#   Governor: sugov_ext (保留不切)
+#   thermal : cpu-little-* / cpu-medium-* / cpu-big-* / cpu-dsu*
+#
+# 硬约束(实测 2026-10-30): 写 scaling_max_freq 超过 2000000/2800000/3200000 会被
+# mtk-cpufreq-hw 静默钳回去(不是温控, 写 sports_mode=1 也解不开)。所以档位一律以
+# cpuinfo_max_freq(标称)为 100% 基准。**不要**拿"当前可达上限"当基准: 那玩意会随
+# 小米 miperf2 的 freq QoS 在 1.2G~3.3G 之间跳, 一掉档位就整体塌到底。
+
+PATH=/system/bin:/system/xbin:/data/adb/ksu/bin:/data/adb/magisk:$PATH
+export PATH
+
+BB=/data/adb/ksu/bin/busybox
+[ -x "$BB" ] || BB=/data/adb/magisk/busybox
+[ -x "$BB" ] || BB=busybox
+
+MODDIR=${MODDIR:-/data/adb/modules/kpad_cpuctl}
+[ -d "$MODDIR" ] || MODDIR=/data/adb/modules/kpad_cpuctl
+STATE=/data/adb/kpad_cpuctl
+BACKUP=$STATE/backup
+CFG=/sys/devices/system/cpu/cpufreq
+CPUX=/sys/devices/system/cpu
+BATT=/sys/class/power_supply/battery
+KTH=/sys/kernel/thermal
+CMDLINE=/proc/cmdline
+SELF=$MODDIR/bin/cpuctl
+WEBROOT=$MODDIR/webroot
+WEBCONF=$MODDIR/httpd.conf
+INTERVAL=${CPUCTL_INTERVAL:-10}
+
+[ -f "$MODDIR/bin/profiles.sh" ] && . "$MODDIR/bin/profiles.sh"
+mkdir -p "$STATE" "$BACKUP"
+
+# ---------------- 基础工具 ----------------
+get() { cat "$1" 2>/dev/null; }
+is_num() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+# 毫摄氏度 -> "39.7℃"; 解析不了就原样返回, 不吞异常值
+fmt_t() {
+    local v="$1" neg="" i d
+    case "$v" in -*) neg="-"; v=${v#-} ;; esac
+    is_num "$v" || { echo "${1:-NA}"; return 0; }
+    i=$((v / 1000)); d=$(( (v % 1000) / 100 ))
+    echo "${neg}$i.$d℃"
+}
+
+# kHz -> "1.28G" / "800M"
+ghz_khz() {
+    local v="$1"
+    is_num "$v" || { echo "${1:-0}"; return 0; }
+    if [ "$v" -ge 1000000 ]; then
+        echo "$((v / 1000000)).$(( (v % 1000000) / 100000 ))G"
+    else
+        echo "$((v / 1000))M"
+    fi
+}
+
+# 每次开机把缓存清一遍(天花板探测结果与会话绑定)
+boot_guard() {
+    local bid
+    bid=$(get /proc/sys/kernel/random/boot_id)
+    [ -z "$bid" ] && bid=$(get "$KTH/utc_count")
+    if [ "$(get "$STATE/boot_id")" != "$bid" ]; then
+        rm -f "$STATE"/ceil.p* "$STATE"/tz_*.list "$STATE"/gpu_* "$STATE"/tgt.p* "$STATE"/eff.p*
+        echo "$bid" > "$STATE/boot_id" 2>/dev/null
+    fi
+}
+
+# ---------------- 拓扑发现 ----------------
+CL_IDS=""
+CL_N=0
+
+detect_clusters() {
+    local p id
+    CL_IDS=""
+    for p in "$CFG"/policy[0-9]*; do
+        [ -d "$p" ] || continue
+        id=${p##*/policy}
+        case "$id" in ''|*[!0-9]*) continue ;; esac
+        CL_IDS="$CL_IDS $id"
+    done
+    CL_IDS=${CL_IDS# }
+    CL_N=0
+    for id in $CL_IDS; do CL_N=$((CL_N + 1)); done
+}
+
+# related_cpus "0 1 2 3" -> "0-3"
+cpus_span() {
+    local first="" last="" c
+    for c in $(get "$CFG/policy$1/related_cpus"); do
+        [ -z "$first" ] && first=$c
+        last=$c
+    done
+    [ -z "$first" ] && first=$1
+    if [ "$first" = "$last" ]; then echo "$first"; else echo "$first-$last"; fi
+}
+
+# 簇名: 按簇序从低到高给名字, 簇数不同时降级
+cluster_name() {
+    local i=$1
+    case "$CL_N" in
+        1) echo "全核心" ;;
+        2) case "$i" in 0) echo "性能核" ;; *) echo "超大核" ;; esac ;;
+        *) case "$i" in 0) echo "能效核" ;; 1) echo "性能核" ;; 2) echo "超大核" ;; *) echo "簇$i" ;; esac ;;
+    esac
+}
+
+# 3 槽档位表 -> 本机簇序。簇数不足 3 时右对齐(优先保住大核参数)
+slot_of() { echo $(( $1 + 3 - CL_N )); }
+
+# 取 3 个候选值里的第 n 个
+pick3() { case "$1" in 0) echo "$2" ;; 1) echo "$3" ;; *) echo "$4" ;; esac; }
+
+cluster_min_freq() { get "$CFG/policy$1/cpuinfo_min_freq"; }
+cluster_hw_max()  { get "$CFG/policy$1/cpuinfo_max_freq"; }
+
+# 该簇"此刻真正能写进去的上限"(天花板)。
+#
+# 关键实测(2026-10-30): 这个值**不是常数**。同一台机器:
+#   30℃ 时 policy7=3200000, 37℃ 时=2800000, 更热时直接被压到 798000(=最低频)。
+# 这是 MTK/小米的 SLM 一类限制器在动, 不是我们的代码问题, 也解不开
+# (sports_mode=1 无效)。所以天花板按 TTL 缓存并周期重探, 档位百分比跟着漂,
+# 这样"拉满"永远是"当前能到的最高", 而不是写死一个很快就会失效的数字。
+CEIL_TTL=${CEIL_TTL:-30}
+
+read_ceil_cache() {
+    local cf="$STATE/ceil.p$1" v ts now
+    [ -s "$cf" ] || return 1
+    read -r v ts < "$cf"
+    is_num "$v" || return 1
+    is_num "$ts" || return 1
+    [ "$v" -gt 0 ] || return 1
+    now=$(date +%s)
+    [ $((now - ts)) -gt "$CEIL_TTL" ] && return 1
+    echo "$v"
+}
+
+probe_ceiling() {
+    local p=$CFG/policy$1 hi cur got
+    [ -d "$p" ] || { echo 0; return; }
+    hi=$(get "$p/cpuinfo_max_freq")
+    is_num "$hi" || { echo 0; return; }
+    cur=$(get "$p/scaling_max_freq")
+    echo "$hi" > "$p/scaling_max_freq" 2>/dev/null
+    got=$(get "$p/scaling_max_freq")
+    # 立刻还原, 不留"放开上限"的窗口
+    [ -n "$cur" ] && echo "$cur" > "$p/scaling_max_freq" 2>/dev/null
+    is_num "$got" || got=$hi
+    echo "$got $(date +%s)" > "$STATE/ceil.p$1" 2>/dev/null
+    echo "$got"
+}
+
+cluster_ceiling() {
+    local v
+    v=$(read_ceil_cache "$1") && { echo "$v"; return; }
+    probe_ceiling "$1"
+}
+
+# ---------------- 频率换算 ----------------
+# 内核给出的 scaling_available_frequencies 一般是**降序**(3730000 打头),
+# 原版 pick_ge 假设升序并 break, 在本机会直接返回最高频。这里全部扫完再选。
+pick_ge() {  # >= want 的最小可用频率
+    local pol=$1 want=$2 f best=""
+    for f in $(get "$CFG/policy$pol/scaling_available_frequencies"); do
+        is_num "$f" || continue
+        [ "$f" -ge "$want" ] || continue
+        if [ -z "$best" ] || [ "$f" -lt "$best" ]; then best=$f; fi
+    done
+    [ -z "$best" ] && best=$(cluster_ceiling "$pol")
+    echo "$best"
+}
+
+pick_le() {  # <= want 的最大可用频率
+    local pol=$1 want=$2 f best=""
+    for f in $(get "$CFG/policy$pol/scaling_available_frequencies"); do
+        is_num "$f" || continue
+        [ "$f" -le "$want" ] || continue
+        if [ -z "$best" ] || [ "$f" -gt "$best" ]; then best=$f; fi
+    done
+    [ -z "$best" ] && best=$(cluster_min_freq "$pol")
+    echo "$best"
+}
+
+# 百分比 -> 该簇实际频率
+#
+# 分母用 **cpuinfo_max_freq(硬件标称, 稳定)** 而不是"当前可达上限"。
+# 原因: 实测这台机器有一个动态上限(miperf2/joyose 注册的 freq QoS, 1.2G~3.3G 之间乱跳),
+# 写超过它的值会被静默钳到上限。若拿它当分母, 上限一掉档位就整体塌到底(实测 56% 档
+# 被算成 622MHz)。用标称值做分母, 目标稳定; 被钳时只是"实际没达到目标", 上限恢复后
+# 自动跟上, 行为可预测。
+freq_by_pct() {
+    local pol=$1 pct=$2 ref lo want
+    ref=$(cluster_hw_max "$pol")
+    is_num "$ref" || { echo 0; return; }
+    lo=$(cluster_min_freq "$pol")
+    is_num "$lo" || lo=0
+    want=$(( ref * pct / 100 ))
+    [ "$want" -lt "$lo" ] && want=$lo
+    pick_le "$pol" "$want"
+}
+
+# ---------------- CPU 写入 ----------------
+apply_policy() {
+    local pol=$1 tmin=$2 tmax=$3 gov=$4 p amin amax i cur eff
+    p="$CFG/policy$pol"
+    [ -d "$p" ] || return 1
+    amin=$(pick_ge "$pol" "$tmin")
+    amax=$(pick_le "$pol" "$tmax")
+    [ -n "$amin" ] && [ -n "$amax" ] && [ "$amin" -gt "$amax" ] && amin=$amax
+    if [ -n "$gov" ] && [ "$(get "$p/scaling_governor")" != "$gov" ]; then
+        echo "$gov" > "$p/scaling_governor" 2>/dev/null
+    fi
+    # 先抬上限再压下限, 避免 min>max 被内核拒
+    echo "$amax" > "$p/scaling_max_freq" 2>/dev/null
+    echo "$amin" > "$p/scaling_min_freq" 2>/dev/null
+    echo "$amax" > "$p/scaling_max_freq" 2>/dev/null
+    # 目标可能被系统动态上限钳低: 记下"目标"和"实际生效值", 不在这里循环硬顶
+    # (硬顶只会每轮刷 sysfs, 上限恢复后守护自然会重新写上去)
+    echo "$amax" > "$STATE/tgt.p$pol" 2>/dev/null
+    echo "$(get "$p/scaling_max_freq")" > "$STATE/eff.p$pol" 2>/dev/null
+    return 0
+}
+
+enforce_policy() {
+    local pol=$1 tmin=$2 tmax=$3 gov=$4 p amin amax cur
+    p="$CFG/policy$pol"
+    [ -d "$p" ] || return 1
+    amin=$(pick_ge "$pol" "$tmin")
+    amax=$(pick_le "$pol" "$tmax")
+    [ -n "$amin" ] && [ -n "$amax" ] && [ "$amin" -gt "$amax" ] && amin=$amax
+    # 比的是**实际值**而不是"目标有没有变"。
+    # 踩过的坑: 只比目标时, 系统把频率压下去之后目标还在、判定"无需写", 就再也拉不回来
+    # (实测 heavy 档从 3.3G 被压到 798M 后一直不恢复)。每轮 10s 重写一次, 被钳时也无害。
+    cur=$(get "$p/scaling_max_freq")
+    if [ "$cur" != "$amax" ]; then
+        echo "$amax" > "$p/scaling_max_freq" 2>/dev/null
+        echo "$amax" > "$STATE/tgt.p$pol" 2>/dev/null
+        echo "$(get "$p/scaling_max_freq")" > "$STATE/eff.p$pol" 2>/dev/null
+    fi
+    [ "$(get "$p/scaling_min_freq")" != "$amin" ] && echo "$amin" > "$p/scaling_min_freq" 2>/dev/null
+    if [ -n "$gov" ] && [ "$(get "$p/scaling_governor")" != "$gov" ]; then
+        echo "$gov" > "$p/scaling_governor" 2>/dev/null
+    fi
+}
+
+default_gov() {
+    case "$(get "$CFG/policy${1:-0}/scaling_governor")" in
+        "") echo sugov_ext ;;
+        *)  get "$CFG/policy${1:-0}/scaling_governor" ;;
+    esac
+}
+
+# ---------------- GPU (Mali devfreq) ----------------
+# 原版走 kgsl 的 pwrlevel; 本机 GPU 是 Mali-G925, 没有 kgsl。
+# 限频的真正开关是 cooling_device(type=devfreq-48000000.mali).cur_state:
+# 实测 state=15 -> devfreq max_freq=1222000000, state=0 -> 1612000000, 即 cur_state
+# 就是"降序频点表的下标"。所以档位 = 下标, 不用自己去改 max_freq。
+GPU=""
+GCDEV=""
+GPU_N=0
+
+resolve_gpu() {
+    local d t name
+    GPU=""; GCDEV=""
+    [ -s "$STATE/gpu_cdev" ] && {
+        IFS='|' read -r GCDEV GPU < "$STATE/gpu_cdev"
+        [ -d "$GCDEV" ] && [ -d "$GPU" ] && { GPU_N=$(gpu_count); [ "$GPU_N" -gt 1 ] && return 0; }
+        GCDEV=""; GPU=""
+    }
+    for d in /sys/class/thermal/cooling_device*; do
+        t=$(get "$d/type")
+        case "$t" in
+            devfreq-*.mali)
+                name=${t#devfreq-}
+                if [ -d "/sys/class/devfreq/$name" ]; then
+                    GCDEV=$d; GPU=/sys/class/devfreq/$name
+                    break
+                fi ;;
+        esac
+    done
+    if [ -z "$GPU" ]; then
+        for d in /sys/class/devfreq/*; do
+            case "${d##*/}" in
+                *mali*) GPU=$d; break ;;
+            esac
+        done
+    fi
+    GPU_N=$(gpu_count)
+    [ -n "$GPU" ] && [ -n "$GCDEV" ] && echo "$GCDEV|$GPU" > "$STATE/gpu_cdev" 2>/dev/null
+}
+
+gpu_count() {
+    local n=0 f
+    for f in $(get "$GPU/available_frequencies"); do is_num "$f" && n=$((n + 1)); done
+    echo "$n"
+}
+
+gpu_top_mhz() {
+    local f
+    for f in $(get "$GPU/available_frequencies"); do
+        is_num "$f" && { echo $((f / 1000000)); return 0; }
+    done
+    echo 0
+}
+
+gpu_freq_at() {  # 档位下标 -> MHz
+    local i=0 f
+    for f in $(get "$GPU/available_frequencies"); do
+        is_num "$f" || continue
+        [ "$i" = "$1" ] && { echo $((f / 1000000)); return 0; }
+        i=$((i + 1))
+    done
+    echo 0
+}
+
+# 百分比 -> 档位下标 (100% = 0 档最高频, 0% = 最后一档最低频)
+gpu_level_from_pct() {
+    local pct=$1 n=$GPU_N
+    [ "$n" -le 1 ] && { echo 0; return; }
+    [ "$pct" -ge 100 ] && { echo 0; return; }
+    [ "$pct" -le 0 ] && { echo $((n - 1)); return; }
+    echo $(( (100 - pct) * (n - 1) / 100 ))
+}
+
+gpu_set_level() {
+    local lv=$1 want mhz
+    is_num "$lv" || return 1
+    [ "$lv" -ge 0 ] || return 1
+    [ -n "$GPU_N" ] && [ "$GPU_N" -gt 1 ] && [ "$lv" -ge "$GPU_N" ] && return 1
+    [ -n "$GCDEV" ] && echo "$lv" > "$GCDEV/cur_state" 2>/dev/null
+    # 同时把 devfreq 的 max_freq 对齐(有些 kernel 会自己重算, 双保险)
+    case "$lv" in
+        0) want="" ;;
+        *) want="" ;;
+    esac
+    mhz=$(gpu_freq_at "$lv")
+    [ "$mhz" -gt 0 ] && echo $((mhz * 1000000)) > "$GPU/max_freq" 2>/dev/null
+    [ "$(get "$GCDEV/cur_state")" = "$lv" ]
+}
+
+gpu_enforce() {
+    local lv=$1 cur
+    [ -n "$GCDEV" ] || return 1
+    cur=$(get "$GCDEV/cur_state")
+    [ "$cur" != "$lv" ] && echo "$lv" > "$GCDEV/cur_state" 2>/dev/null
+    [ "$cur" != "$lv" ]
+}
+
+# 把 GPU 钉在最高频(max 档用): min_freq 抬到顶, 让 devfreq 无法下探
+gpu_pin_top() {
+    local top
+    top=$(gpu_freq_at 0)
+    [ "$top" -gt 0 ] && echo $((top * 1000000)) > "$GPU/min_freq" 2>/dev/null
+}
+
+gpu_unpin() {
+    local lo
+    lo=$(get "$GPU/min_freq")
+    is_num "$lo" || return 0
+    # 恢复到该型号 devfreq 的最小值
+    [ -n "$GPU" ] && echo 338000000 > "$GPU/min_freq" 2>/dev/null
+}
+
+gpu_temp() {
+    local raw
+    raw=$(get "$KTH/gpu_info")
+    [ -z "$raw" ] && { echo 0; return; }
+    echo "${raw%%,*}" | tr -dc '0-9-'
+}
+
+# ---------------- 温度 ----------------
+build_tz_cache() {
+    : > "$STATE/tz_cpu.list"
+    : > "$STATE/tz_batt.list"
+    # 一次 awk 读完所有 type(本机 96 个 zone, 逐个 cat 就是 96 次 fork)
+    awk '{print FILENAME "|" $0}' /sys/class/thermal/thermal_zone*/type 2>/dev/null |
+    while IFS='|' read -r f t; do
+        case "$t" in
+            cpu-*)  echo "${f%/type}" >> "$STATE/tz_cpu.list" ;;
+            battery|batt_therm) echo "${f%/type}" >> "$STATE/tz_batt.list" ;;
+        esac
+    done
+}
+
+cpu_temp() {
+    local z v max=0
+    [ -s "$STATE/tz_cpu.list" ] || build_tz_cache
+    [ -s "$STATE/tz_cpu.list" ] || { echo 0; return; }
+    while read -r z; do
+        v=$(get "$z/temp")
+        is_num "$v" || continue
+        [ "$v" -gt "$max" ] && max=$v
+    done < "$STATE/tz_cpu.list"
+    echo "$max"
+}
+
+batt_temp() {
+    local z v
+    [ -s "$STATE/tz_batt.list" ] || build_tz_cache
+    while read -r z; do
+        v=$(get "$z/temp")
+        is_num "$v" && { echo "$v"; return 0; }
+    done < "$STATE/tz_batt.list"
+    v=$(get "$BATT/temp")
+    is_num "$v" || { echo 0; return; }
+    # battery/temp 单位是 0.1℃(273 = 27.3℃), thermal_zone 是 m℃, 统一成 m℃
+    [ "$v" -lt 1000 ] && v=$((v * 100))
+    echo "$v"
+}
+
+# ---------------- 功耗 ----------------
+batt_power() {
+    local out mw ma mv st stcn w d
+    out=$("$BB" awk '
+        FILENAME ~ "current_now$" { I=$1+0; next }
+        FILENAME ~ "voltage_now$" { V=$1+0; next }
+        FILENAME ~ "status$"      { ST=$1; next }
+        END {
+            mw=(V*I)/1000000000; if (mw<0) mw=-mw
+            printf "%d|%d|%d|%s\n", mw, I/1000, V/1000, ST
+        }
+    ' "$BATT/current_now" "$BATT/voltage_now" "$BATT/status" 2>/dev/null)
+    [ -z "$out" ] && { echo "读不到电池信息"; return 1; }
+    IFS='|' read -r mw ma mv st <<EOF
+$out
+EOF
+    is_num "$mw" || mw=0
+    # 电流是负数(充电)时 is_num 会判失败, 先去符号再校验
+    case "$ma" in -*) ma=${ma#-} ;; esac
+    is_num "$ma" || ma=0
+    is_num "$mv" || mv=0
+    ma=${ma#-}
+    case "$st" in
+        Charging)       stcn="充电中" ;;
+        Full)           stcn="已充满" ;;
+        Discharging)    stcn="放电中" ;;
+        "Not charging") stcn="未充电" ;;
+        *)              stcn=${st:-未知} ;;
+    esac
+    w=$((mw / 1000)); d=$(( (mw % 1000) / 10 ))
+    printf '%d.%02d W  (%d.%02dV × %dmA, %s)' \
+        "$w" "$d" $((mv / 1000)) $(( (mv % 1000) / 10 )) "$ma" "$stcn"
+}
+
+# ---------------- 核心开关 ----------------
+NCPU=$(get "$CPUX/present" | tr ',' '\n' | head -1)
+case "$NCPU" in
+    *-*) NCPU=$(( ${NCPU#*-} + 1 )) ;;
+    *)   NCPU=8 ;;
+esac
+
+valid_mask() {
+    local m="$1"
+    [ ${#m} -eq "$NCPU" ] || return 1
+    case "$m" in *[!01]*) return 1 ;; esac
+    return 0
+}
+
+core_mask() {
+    local m
+    m=$(get "$STATE/cores")
+    valid_mask "$m" || m="" 
+    [ -z "$m" ] && { m=""; local i=0; while [ "$i" -lt "$NCPU" ]; do m="${m}1"; i=$((i+1)); done; }
+    # cpu0 是引导核, 任何入口都强制为 1
+    echo "1${m#?}"
+}
+
+core_state() {
+    local n=0 p out=""
+    while [ "$n" -lt "$NCPU" ]; do
+        p=$CPUX/cpu$n/online
+        if [ -e "$p" ]; then out="$out$(get "$p")"; else out="${out}1"; fi
+        n=$((n + 1))
+    done
+    echo "$out"
+}
+
+core_save() {
+    local n=$1 v=$2 m i=0 out=""
+    m=$(core_mask)
+    while [ "$i" -lt "$NCPU" ]; do
+        if [ "$i" = "$n" ]; then out="$out$v"; else out="$out${m:$i:1}"; fi
+        i=$((i + 1))
+    done
+    echo "1${out#?}" > "$STATE/cores"
+}
+
+# 0 成功 / 1 内核拒绝 / 2 无 online 节点
+core_set() {
+    local n=$1 v=$2 p=$CPUX/cpu$1/online i=0
+    [ -e "$p" ] || return 2
+    while [ "$i" -lt 4 ]; do
+        echo "$v" > "$p" 2>/dev/null
+        [ "$(get "$p")" = "$v" ] && return 0
+        sleep 0.15 2>/dev/null || sleep 1
+        i=$((i + 1))
+    done
+    [ "$(get "$p")" = "$v" ] && return 0
+    return 1
+}
+
+core_enforce() {
+    local m n=0 p v want
+    m=$(core_mask)
+    while [ "$n" -lt "$NCPU" ]; do
+        p=$CPUX/cpu$n/online
+        if [ -e "$p" ]; then
+            v=$(get "$p")
+            if [ "$n" = "0" ]; then want=1; else want=${m:$n:1}; fi
+            [ "$want" != "$v" ] && echo "$want" > "$p" 2>/dev/null
+        fi
+        n=$((n + 1))
+    done
+}
+
+# ---------------- 备份 / 还原 ----------------
+cmd_backup() {
+    local f="$BACKUP/stock.conf" id
+    mkdir -p "$BACKUP"
+    {
+        echo "# REDMI K Pad (turner) 原始配置快照"
+        echo "time=$(date '+%Y-%m-%d %H:%M:%S')"
+        echo "build=$(getprop ro.build.display.id)"
+        echo "clusters=$CL_IDS"
+        for id in $CL_IDS; do
+            echo "p${id}_gov=$(get "$CFG/policy$id/scaling_governor")"
+            echo "p${id}_min=$(get "$CFG/policy$id/scaling_min_freq")"
+            echo "p${id}_max=$(get "$CFG/policy$id/scaling_max_freq")"
+            echo "p${id}_ceil=$(cluster_ceiling "$id")"
+        done
+        echo "gpu_cdev=$(get "$STATE/gpu_cdev")"
+        echo "gpu_cdev_state=$(get "$GCDEV/cur_state")"
+        echo "gpu_min=$(get "$GPU/min_freq")"
+        echo "gpu_max=$(get "$GPU/max_freq")"
+        echo "cores=$(core_state)"
+    } > "$f"
+    echo "已备份到 $f"
+    cat "$f"
+}
+
+restore_stock_values() {
+    local f="$BACKUP/stock.conf" k v id
+    # CPU 一律回到"标称上下限", 不用快照里的绝对值。
+    # 原因: 快照可能是在系统动态限频期间拍的(实测快照里 p4_max=1200000 就是被钳住的瞬间值),
+    # 照抄会把一个很低的帽子永久扣上。写成 cpuinfo_max 后, 系统自己的限幅器该钳自然会钳,
+    # 松开时也能自动回到高位, 这才是"出厂默认"的语义。
+    for id in $CL_IDS; do
+        echo "$(cluster_min_freq "$id")" > "$CFG/policy$id/scaling_min_freq" 2>/dev/null
+        echo "$(cluster_hw_max "$id")"   > "$CFG/policy$id/scaling_max_freq" 2>/dev/null
+    done
+    # GPU 的温控档位(cooling state)恢复成快照值, 没有就用系统默认 0
+    v=0
+    if [ -f "$f" ]; then
+        while IFS='=' read -r k v2; do
+            case "$k" in
+                gpu_cdev_state) is_num "$v2" && v=$v2 ;;
+                cores) [ -n "$v2" ] && valid_mask "$v2" && echo "$v2" > "$STATE/cores" ;;
+            esac
+        done < "$f"
+    fi
+    [ -n "$GCDEV" ] && echo "$v" > "$GCDEV/cur_state" 2>/dev/null
+    gpu_unpin
+    rm -f "$STATE"/tgt.p* "$STATE"/eff.p* 2>/dev/null
+    core_enforce
+}
+
+# ---------------- 档位 ----------------
+# 把一行档位表解析成"每簇的 min/max 目标频率" + gpu 档位
+# 输出: "pol|tmin|tmax ... #gpu_level"
+profile_targets() {
+    local key="$1" line k n d lmin lmax mmin mmax bmin bmax gpup i=0 id slot tmin tmax out="" gpu
+    line=$(profiles_dump | grep "^$key|")
+    [ -z "$line" ] && return 1
+    IFS='|' read -r k n d lmin lmax mmin mmax bmin bmax gpup <<EOF
+$line
+EOF
+    for id in $CL_IDS; do
+        slot=$(slot_of "$i")
+        tmin=$(pick3 "$slot" "$lmin" "$mmin" "$bmin")
+        tmax=$(pick3 "$slot" "$lmax" "$mmax" "$bmax")
+        out="$out $id:$(freq_by_pct "$id" "$tmin"):$(freq_by_pct "$id" "$tmax")"
+        i=$((i + 1))
+    done
+    case "$gpup" in
+        R) gpu="R" ;;
+        *) gpu=$(gpu_level_from_pct "$gpup") ;;
+    esac
+    echo "${out# }#$gpu"
+}
+
+profile_apply() {
+    local key="$1" tg spec gpu part id tmin tmax
+    tg=$(profile_targets "$key") || { echo "未知档位: $key"; return 1; }
+    spec=${tg%%#*}; gpu=${tg##*#}
+    echo "$key" > "$STATE/profile"
+    if [ "$key" = "stock" ]; then
+        restore_stock_values
+        echo "已切换到 [出厂默认]  系统原生调度，不做任何约束"
+        return 0
+    fi
+    for part in $spec; do
+        id=${part%%:*}
+        tmin=$(echo "$part" | cut -d: -f2)
+        tmax=$(echo "$part" | cut -d: -f3)
+        apply_policy "$id" "$tmin" "$tmax" "$(default_gov "$id")"
+    done
+    if [ "$gpu" = "R" ]; then
+        rm -f "$STATE/gpu_level"
+        gpu_unpin
+    else
+        echo "$gpu" > "$STATE/gpu_level"
+        gpu_set_level "$gpu"
+        if [ "$key" = "max" ]; then gpu_pin_top; else gpu_unpin; fi
+    fi
+    if [ "$key" = "max" ]; then
+        local sec
+        sec=$(get "$STATE/max_seconds")
+        is_num "$sec" || sec=300
+        echo $(( $(date +%s) + sec )) > "$STATE/max_until"
+        echo "已切换到 [全拉满测速] — ${sec} 秒后自动回落到「重度游戏」"
+    else
+        rm -f "$STATE/max_until"
+        echo "已切换到 [$key]  $(profiles_dump | grep "^$key|" | cut -d'|' -f2)"
+    fi
+}
+
+profile_enforce() {
+    local key="$1" tg spec gpu part id tmin tmax
+    tg=$(profile_targets "$key") || return 1
+    spec=${tg%%#*}; gpu=${tg##*#}
+    for part in $spec; do
+        id=${part%%:*}
+        tmin=$(echo "$part" | cut -d: -f2)
+        tmax=$(echo "$part" | cut -d: -f3)
+        enforce_policy "$id" "$tmin" "$tmax" "$(default_gov "$id")"
+    done
+    [ "$gpu" != "R" ] && gpu_enforce "$gpu"
+    return 0
+}
+
+custom_apply() {
+    local id a b
+    for id in $CL_IDS; do
+        a=$(get "$STATE/custom_p${id}_min")
+        b=$(get "$STATE/custom_p${id}_max")
+        is_num "$a" && is_num "$b" && apply_policy "$id" "$a" "$b" ""
+    done
+    [ -n "$(get "$STATE/gpu_level")" ] && gpu_set_level "$(get "$STATE/gpu_level")"
+    return 0
+}
+
+custom_enforce() {
+    local id a b
+    for id in $CL_IDS; do
+        a=$(get "$STATE/custom_p${id}_min")
+        b=$(get "$STATE/custom_p${id}_max")
+        is_num "$a" && is_num "$b" && enforce_policy "$id" "$a" "$b" ""
+    done
+    local gl; gl=$(get "$STATE/gpu_level")
+    [ -n "$gl" ] && gpu_enforce "$gl"
+    return 0
+}
+
+cmd_apply() {
+    local key="$1" tg spec part id tmin tmax
+    [ -z "$key" ] && { echo "用法: cpuctl apply <档位>"; return 1; }
+    if [ "$key" = "custom" ]; then
+        custom_apply
+        echo custom > "$STATE/profile"
+        echo "已按自定义频率生效"
+        return 0
+    fi
+    profile_apply "$key"
+}
+
+# cpuctl set <clusterId> <min> <max>
+cmd_set() {
+    local pol="$1" mn="$2" mx="$3" id
+    case " $CL_IDS " in
+        *" $pol "*) ;;
+        *) echo "用法: cpuctl set <簇ID: $CL_IDS> <min> <max>"; return 1 ;;
+    esac
+    is_num "$mn" && is_num "$mx" || { echo "频率必须是数字(kHz)"; return 1; }
+    [ "$mn" -gt "$mx" ] && { echo "下限不能大于上限"; return 1; }
+    echo "$mn" > "$STATE/custom_p${pol}_min"
+    echo "$mx" > "$STATE/custom_p${pol}_max"
+    echo custom > "$STATE/profile"
+    apply_policy "$pol" "$mn" "$mx" ""
+    echo "$(get "$CFG/policy$pol/scaling_min_freq")" > "$STATE/custom_p${pol}_min"
+    echo "$(get "$CFG/policy$pol/scaling_max_freq")" > "$STATE/custom_p${pol}_max"
+    echo "簇 $pol 自定义: $(get "$STATE/custom_p${pol}_min")-$(get "$STATE/custom_p${pol}_max") kHz"
+}
+
+# cpuctl setall <pol>:<min>:<max> ... [gpu等级]
+cmd_setall() {
+    local spec part pol mn mx gl=""
+    for spec in "$@"; do
+        case "$spec" in
+            *:*:*) ;;
+            *) gl=$spec ;;   # 最后一个纯数字当 GPU 等级
+        esac
+    done
+    echo custom > "$STATE/profile"
+    for spec in "$@"; do
+        case "$spec" in
+            *:*:*) ;;
+            *) continue ;;
+        esac
+        pol=${spec%%:*}
+        mn=$(echo "$spec" | cut -d: -f2)
+        mx=$(echo "$spec" | cut -d: -f3)
+        case " $CL_IDS " in
+            *" $pol "*) ;;
+            *) echo "簇 $pol 不存在"; return 1 ;;
+        esac
+        is_num "$mn" && is_num "$mx" || { echo "频率必须是数字(kHz)"; return 1; }
+        [ "$mn" -le "$mx" ] || { echo "簇 $pol 下限不能大于上限"; return 1; }
+        echo "$mn" > "$STATE/custom_p${pol}_min"
+        echo "$mx" > "$STATE/custom_p${pol}_max"
+        apply_policy "$pol" "$mn" "$mx" ""
+        echo "$(get "$CFG/policy$pol/scaling_min_freq")" > "$STATE/custom_p${pol}_min"
+        echo "$(get "$CFG/policy$pol/scaling_max_freq")" > "$STATE/custom_p${pol}_max"
+    done
+    if [ -n "$gl" ]; then
+        is_num "$gl" || { echo "GPU 等级必须是数字"; return 1; }
+        gpu_set_level "$gl"
+        echo "$gl" > "$STATE/gpu_level"
+    fi
+    echo "已应用自定义频率"
+}
+
+# GPU 当前实际频率(MHz)
+# 【坑·Mali 的 devfreq cur_freq 恒为 26MHz】Redmi K Pad 上
+#   /sys/class/devfreq/48000000.mali/cur_freq 永远是 26000000(26MHz),
+#   GPU 满载时也不变(换 governor 也没用) —— Mali 走 MTK 私有调频路径
+#   (mtk_gpufreq_wrapper), 不经过标准 devfreq 的 cur_freq 上报。
+#   真实频率在 /sys/kernel/thermal/gpu_freq 的第 1 个字段(逗号分隔, 单位 kHz)。
+#   实测游戏加载时该值在 338000~468000 kHz 之间跳。
+# GPU 占用率(%)
+# /proc/mtk_mali/gpu_utilization: "ACTIVE=95 3D/TA/COMPUTE=95/3/2 OPP_IDX=51 MFG_PWR=0"
+#   3D 是 3D 渲染占用(游戏主要看这个), 3D 为 0 时退回 ACTIVE。
+gpu_busy_pct() {
+    local u b a
+    u=$(get /proc/mtk_mali/gpu_utilization)
+    case "$u" in
+        *3D/TA/COMPUTE=*)
+            b=${u#*3D/TA/COMPUTE=}; b=${b%%/*}
+            a=${u#*ACTIVE=}; a=${a%% *}
+            is_num "$b" || b=0
+            is_num "$a" || a=0
+            if [ "$b" -gt 0 ]; then echo "$b"; else echo "$a"; fi
+            ;;
+        *) echo 0 ;;
+    esac
+}
+
+gpu_cur_mhz() {
+    local v
+    # 高通: kgsl 的 clock_mhz 是真·当前频率
+    if [ -e /sys/class/kgsl/kgsl-3d0/clock_mhz ]; then
+        v=$(get /sys/class/kgsl/kgsl-3d0/clock_mhz)
+        is_num "$v" && { echo "$v"; return 0; }
+    fi
+    # 【本机读不到】MTK mt6991 上这两个节点都不是运行频率:
+    #   /sys/kernel/thermal/gpu_freq 恒为最低档 —— 实测把 ged/gpu_bottom_freq 抬到 1GHz、
+    #   devfreq max_freq 放开到 1612MHz、governor 切 performance, 它照样不动;
+    #   devfreq cur_freq 恒为 26MHz(dummy governor 的镜像, 甚至不在 OPP 表里)。
+    #   所以返回 0 = "不可读", 调用方显示 "-", 不伪造数字。
+    echo 0
+}
+
+cmd_gpu() {
+    local v="$1" lvl
+    [ -z "$v" ] && {
+        echo "用法: cpuctl gpu <档位0-$((GPU_N-1))|百分比>"
+        echo "当前: 档位 $(get "$GCDEV/cur_state") = $(gpu_freq_at "$(get "$GCDEV/cur_state")")MHz  上限 $(gpu_top_mhz)MHz"
+        return 1
+    }
+    is_num "$v" || { echo "必须是数字"; return 1; }
+    if [ "$v" -le "$GPU_N" ]; then
+        lvl=$v
+    else
+        lvl=$(gpu_level_from_pct "$v")
+    fi
+    echo "$lvl" > "$STATE/gpu_level"
+    gpu_set_level "$lvl"
+    echo "GPU 已设为档位 $lvl = $(gpu_freq_at "$lvl")MHz"
+}
+
+cmd_temp()  { echo "CPU=$(fmt_t "$(cpu_temp)") GPU=$(fmt_t "$(gpu_temp)") 电池=$(fmt_t "$(batt_temp)")"; }
+cmd_power() { batt_power; echo; }
+
+cmd_core() {
+    local n="$1" v="$2" rc
+    case "$v" in
+        on|1)  v=1 ;;
+        off|0) v=0 ;;
+        *)     echo "用法: cpuctl core <0-$((NCPU-1))> <on|off>"; return 1 ;;
+    esac
+    is_num "$n" || { echo "核心编号 0-$((NCPU-1))"; return 1; }
+    [ "$n" -lt "$NCPU" ] || { echo "核心编号 0-$((NCPU-1))"; return 1; }
+    if [ "$n" = "0" ] && [ "$v" = "0" ]; then
+        echo "cpu0 是引导核, 不允许关闭"
+        return 1
+    fi
+    core_set "$n" "$v"; rc=$?
+    case "$rc" in
+        2) echo "cpu$n 没有 online 节点, 内核不允许单独关闭"; return 1 ;;
+        0) ;;
+        *) echo "cpu$n 切换失败: 内核拒绝(可能不允许关掉该簇最后一个核心)"; return 1 ;;
+    esac
+    core_save "$n" "$v"
+    [ "$v" = "1" ] && echo "cpu$n 已开启" || echo "cpu$n 已关闭"
+}
+
+cmd_cores() {
+    local arg="$1" m i=0
+    if [ -z "$arg" ]; then
+        echo "实际在线: $(core_state)   (按 cpu0-$((NCPU-1)) 排列)"
+        echo "目标状态: $(core_mask)"
+        return 0
+    fi
+    case "$arg" in
+        all|reset)
+            m=""; while [ "$i" -lt "$NCPU" ]; do m="${m}1"; i=$((i+1)); done ;;
+        *)
+            valid_mask "$arg" || { echo "用法: cpuctl cores [all|${NCPU}位掩码]  如 11111100"; return 1; }
+            m="$arg" ;;
+    esac
+    case "$m" in 0*) echo "注: cpu0 是引导核, 已强制保持开启"; m="1${m#?}" ;; esac
+    echo "$m" > "$STATE/cores"
+    core_enforce
+    echo "目标 $m, 实际 $(core_state)"
+}
+
+# ---------------- 守护 ----------------
+cmd_watch_on() {
+    echo 1 > "$STATE/watch_enabled"
+    if [ -n "$(get "$STATE/watch.lock/pid")" ] && kill -0 "$(get "$STATE/watch.lock/pid")" 2>/dev/null; then
+        echo "守护已在运行 (pid $(get "$STATE/watch.lock/pid"))"
+        return 0
+    fi
+    rm -rf "$STATE/watch.lock"
+    sh "$MODDIR/bin/watch_run.sh" >/dev/null 2>&1
+    local i=0
+    while [ "$i" -lt 20 ]; do
+        if [ -n "$(get "$STATE/watch.lock/pid")" ]; then
+            echo "守护已启动 (pid $(get "$STATE/watch.lock/pid"))"
+            return 0
+        fi
+        sleep 0.2 2>/dev/null || sleep 1
+        i=$((i + 1))
+    done
+    echo "守护启动失败"
+    return 1
+}
+
+cmd_watch_off() {
+    echo 0 > "$STATE/watch_enabled"
+    local p
+    p=$(get "$STATE/watch.lock/pid")
+    is_num "$p" && kill "$p" 2>/dev/null
+    sleep 1
+    p=$(get "$STATE/watch.lock/pid")
+    is_num "$p" && kill -9 "$p" 2>/dev/null
+    rm -rf "$STATE/watch.lock"
+    rm -f "$STATE/watch.pid"
+    echo "守护已停止 (频率保持当前值, 不再自动维持)"
+}
+
+cmd_watch_status() {
+    local p
+    p=$(get "$STATE/watch.lock/pid")
+    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+        echo "守护: 运行中 (pid $p)"
+    elif [ "$(get "$STATE/watch_enabled")" = "1" ]; then
+        echo "守护: 已启用但进程未运行"
+    else
+        echo "守护: 已关闭"
+    fi
+}
+
+# ---------------- 屏幕刷新率上限 ----------------
+# 本机面板 supportedRefreshRates = 60/90/120/144/165, 出厂却压在 120。三个键互相牵制,
+# 少写一个就会被另一个拉回去(实测只改 peak 会被 miui_refresh_rate 压回 120):
+#   system/peak_refresh_rate   AOSP 的刷新率上限
+#   secure/user_refresh_rate   AOSP 的"用户选择"
+#   secure/miui_refresh_rate   小米自己记的"用户选的档"
+# 实测: 系统**不会**自己把 165 改回 120(连续观察 40 秒无变化), 唯一的改写来源是
+# 用户进设置手动改 —— 而设置页会同时改这三个键。
+#
+# 【这不是"锁死 165"】LTPO 面板在静止时会自己降到 50/48 省电, 不该去关。这里改的是**上限**,
+# 只有交互/动画时才会真的跑 165 —— 实测桌面/系统设置/浏览器切换后 SF vsyncRate=165.00 Hz。
+RR_KEYS="peak_refresh_rate:system user_refresh_rate:secure miui_refresh_rate:secure"
+RR_NODE=/sys/class/mi_display/disp-DSI-0/dynamic_fps
+
+rr_show() {
+    local pair key ns v
+    echo "刷新率上限:"
+    for pair in $RR_KEYS; do
+        key=${pair%%:*}; ns=${pair##*:}
+        v=$(settings get "$ns" "$key" 2>/dev/null)
+        echo "  $ns/$key = ${v:--}"
+    done
+    echo "  模块记录   = $(get "$STATE/refresh_hz" 2>/dev/null)"
+    echo "  出厂原值   = $(get "$STATE/refresh_orig" 2>/dev/null)"
+    echo -n "  面板支持   : "
+    dumpsys display 2>/dev/null | grep -m1 -o "supportedRefreshRates \[[^]]*\]" | sed 's/supportedRefreshRates //'
+    echo -n "  SF 当前    : "
+    dumpsys SurfaceFlinger 2>/dev/null | grep -m1 -o "vsyncRate=[0-9.]* Hz"
+    echo -n "  面板当前   : "
+    v=$(get "$RR_NODE"); echo "${v:-NA} Hz  (静止时 LTPO 会自动降到 48/50)"
+}
+
+rr_lock_state() {
+    local p
+    if [ -f "$STATE/refresh_lock" ]; then
+        p=$(get "$STATE/refresh_lock.pid")
+        if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+            echo "  守护       : 运行中 (pid $p)"
+        else
+            echo "  守护       : 已启用但进程未运行"
+        fi
+        [ -s "$STATE/refresh_lock_gaveup" ] && echo "  守护       : 已放弃 —— $(cat "$STATE/refresh_lock_gaveup")"
+    else
+        echo "  守护       : 关闭"
+    fi
+}
+
+cmd_refresh() {
+    local want="$1" pair key ns v n=0
+    case "$want" in
+        ""|status|st) rr_show; rr_lock_state; return 0 ;;
+        lock)
+            case "$2" in
+                on)
+                    local hz; hz=$(get "$STATE/refresh_hz")
+                    case "$hz" in ''|*[!0-9]*) hz=$(settings get system peak_refresh_rate) ;; esac
+                    case "$hz" in ''|null|*[!0-9]*) hz=165 ;; esac
+                    echo "$hz" > "$STATE/refresh_hz"
+                    : > "$STATE/refresh_lock"
+                    rm -f "$STATE/refresh_lock_gaveup"
+                    local old; old=$(get "$STATE/refresh_lock.pid")
+                    [ -n "$old" ] && kill -9 "$old" 2>/dev/null
+                    nohup sh "$MODDIR/bin/rr_lock.sh" >/dev/null 2>&1 &
+                    sleep 1
+                    echo "已开启刷新率守护(每 ${RR_LOCK_INTERVAL:-10}s 校正一次, 上限 ${hz}Hz)"
+                    rr_lock_state ;;
+                off)
+                    rm -f "$STATE/refresh_lock"
+                    local old; old=$(get "$STATE/refresh_lock.pid")
+                    [ -n "$old" ] && kill -9 "$old" 2>/dev/null
+                    rm -f "$STATE/refresh_lock.pid"
+                    echo "已关闭刷新率守护(改为跟手: 你在设置里改成多少就是多少, 重启后按模块记录恢复)"
+                    ;;
+                *) echo "用法: cpuctl refresh lock <on|off>" ;;
+            esac
+            return 0 ;;
+    esac
+    case "$want" in
+        auto|off|default)
+            want=$(get "$STATE/refresh_orig" 2>/dev/null)
+            case "$want" in ''|*[!0-9]*) want=120 ;; esac
+            ;;
+    esac
+    case "$want" in
+        48|50|60|90|120|144|165) ;;
+        *) echo "用法: cpuctl refresh [status|48|50|60|90|120|144|165|auto]"; return 1 ;;
+    esac
+    # 第一次干预前存下出厂值, 供 auto 还原(只存一次, 不要被后面的写入覆盖)
+    if [ ! -f "$STATE/refresh_orig" ]; then
+        v=$(settings get system peak_refresh_rate 2>/dev/null)
+        case "$v" in ''|null|*[!0-9]*) v=120 ;; esac
+        echo "$v" > "$STATE/refresh_orig"
+    fi
+    for pair in $RR_KEYS; do
+        key=${pair%%:*}; ns=${pair##*:}
+        settings put "$ns" "$key" "$want" 2>/dev/null && n=$((n + 1))
+    done
+    if [ "$n" -lt 2 ]; then
+        echo "写入失败: 只有 $n/3 个键写成功 (需要 root)"
+        return 1
+    fi
+    echo "$want" > "$STATE/refresh_hz"
+    echo "刷新率上限 -> ${want}Hz ($n/3 键)"
+    sleep 2
+    echo -n "  SF 当前: "; dumpsys SurfaceFlinger 2>/dev/null | grep -m1 -o "vsyncRate=[0-9.]* Hz"
+    echo "  注意: 静止时面板仍会降到 48/50Hz(LTPO 省电), 交互/动画时才是 ${want}Hz"
+}
+
+cmd___watch() {
+    local prof limit t until now id
+    while [ "$(get "$STATE/watch_enabled")" = "1" ]; do
+        # 顺手刷新一次"系统当前上限"(带 TTL, 30s 才真探测), 供 status / WebUI 展示
+        for id in $CL_IDS; do cluster_ceiling "$id" >/dev/null 2>&1; done
+        prof=$(get "$STATE/profile")
+        [ -z "$prof" ] && prof=balanced
+        if [ "$prof" = "max" ]; then
+            until=$(get "$STATE/max_until")
+            now=$(date +%s)
+            if is_num "$until" && [ "$now" -ge "$until" ]; then
+                profile_apply heavy >/dev/null 2>&1
+                prof=heavy
+            fi
+        fi
+        if [ "$prof" != "stock" ]; then
+            limit=$(get "$STATE/temp_limit")
+            is_num "$limit" || limit=60000
+            t=$(cpu_temp)
+            if is_num "$t" && [ "$t" -ge "$limit" ]; then
+                # 到温度上限: 让权给系统温控, 不再强行拉频
+                echo 1 > "$STATE/throttled"
+            else
+                echo 0 > "$STATE/throttled"
+                if [ "$prof" = "custom" ]; then custom_enforce; else profile_enforce "$prof"; fi
+            fi
+        fi
+        core_enforce
+        if [ ! -f "$STATE/web_disabled" ] && ! web_alive 2>/dev/null; then
+            sh "$MODDIR/bin/web_spawn.sh" "$(web_port)" >/dev/null 2>&1
+        fi
+        sleep "$INTERVAL"
+    done
+    rm -rf "$STATE/watch.lock"
+}
+
+# ---------------- WebUI ----------------
+web_port() { local p; p=$(get "$STATE/web_port"); is_num "$p" || p=8088; echo "$p"; }
+port_busy() { echo | "$BB" nc -w 1 127.0.0.1 "$1" >/dev/null 2>&1; }
+
+web_cwd_ok() {
+    local pid cwd
+    pid=$(get "$STATE/web.pid")
+    is_num "$pid" || return 1
+    [ -d "/proc/$pid" ] || return 1
+    cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null)
+    [ "$cwd" = "$WEBROOT" ]
+}
+
+web_alive() { port_busy "$(web_port)" && web_cwd_ok; }
+
+kill_httpd() {
+    local pid line
+    ps -A -o PID,ARGS 2>/dev/null | grep -F "busybox httpd -f -p 127.0.0.1:" | grep -v grep |
+    while read -r pid line; do
+        [ "$pid" = "$$" ] && continue
+        kill "$pid" 2>/dev/null
+    done
+    sleep 1
+    ps -A -o PID,ARGS 2>/dev/null | grep -F "busybox httpd -f -p 127.0.0.1:" | grep -v grep |
+    while read -r pid line; do
+        [ "$pid" = "$$" ] && continue
+        kill -9 "$pid" 2>/dev/null
+    done
+}
+
+cmd_web_start() {
+    local port
+    if web_alive; then
+        echo "WebUI 已在运行: http://127.0.0.1:$(web_port)/"
+        return 0
+    fi
+    rm -f "$STATE/web_disabled"
+    [ -d "$WEBROOT" ] || { echo "WebUI 资源缺失: $WEBROOT"; return 1; }
+    if port_busy "$(web_port)"; then
+        kill_httpd; rm -f "$STATE/web.pid"; sleep 1
+    fi
+    for port in 8088 8089 8090 8091 8092; do
+        port_busy "$port" && continue
+        sh "$MODDIR/bin/web_spawn.sh" "$port" >/dev/null 2>&1
+        sleep 1
+        if port_busy "$port"; then
+            echo "WebUI 已启动: http://127.0.0.1:$port/"
+            return 0
+        fi
+    done
+    echo "WebUI 启动失败 (8088-8092 均不可用)"
+    return 1
+}
+
+cmd_web_stop() {
+    echo 1 > "$STATE/web_disabled"
+    local p
+    p=$(get "$STATE/web.pid")
+    is_num "$p" && kill "$p" 2>/dev/null
+    kill_httpd
+    rm -f "$STATE/web.pid"
+    echo "WebUI 已停止"
+}
+
+cmd_web_status() {
+    if web_alive; then
+        echo "WebUI: 运行中 (端口 $(web_port))"
+    elif [ -f "$STATE/web_disabled" ]; then
+        echo "WebUI: 已关闭"
+    else
+        echo "WebUI: 未运行"
+    fi
+}
+
+cmd_web_open() {
+    cmd_web_start >/dev/null 2>&1
+    local port; port=$(web_port)
+    am start --user 0 -a android.intent.action.VIEW -d "http://127.0.0.1:$port/" >/dev/null 2>&1
+    echo "已在浏览器打开: http://127.0.0.1:$port/"
+}
+
+# ---------------- 状态 ----------------
+# ---------------- HUD 状态栏(状态栏通知 + 悬浮窗 App) ----------------
+# 采样由 bin/hud.sh 负责(它会自己探测高通/联发科的节点), cpuctl 只管开关与间隔。
+HUD_STATE=$STATE
+cmd_hud_on() {
+    echo 1 > "$HUD_STATE/hud_enabled"
+    local p
+    p=$(get "$HUD_STATE/hud.lock/pid")
+    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+        echo "HUD 守护已在运行 (pid $p)"
+        return 0
+    fi
+    rm -rf "$HUD_STATE/hud.lock"
+    sh "$MODDIR/bin/hud_run.sh" >/dev/null 2>&1
+    local i=0
+    while [ "$i" -lt 20 ]; do
+        if [ -n "$(get "$HUD_STATE/hud.lock/pid")" ]; then
+            echo "HUD 守护已启动 (pid $(get "$HUD_STATE/hud.lock/pid"))"
+            return 0
+        fi
+        sleep 0.2 2>/dev/null || sleep 1
+        i=$((i + 1))
+    done
+    echo "HUD 守护启动失败"
+    return 1
+}
+
+cmd_hud_off() {
+    echo 0 > "$HUD_STATE/hud_enabled"
+    local p
+    p=$(get "$HUD_STATE/hud.lock/pid")
+    is_num "$p" && kill "$p" 2>/dev/null
+    sleep 1
+    p=$(get "$HUD_STATE/hud.lock/pid")
+    is_num "$p" && kill -9 "$p" 2>/dev/null
+    rm -rf "$HUD_STATE/hud.lock"
+    cmd notification cancel kpadhud >/dev/null 2>&1
+    echo "HUD 已停止"
+}
+
+cmd_hud_status() {
+    local p
+    p=$(get "$HUD_STATE/hud.lock/pid")
+    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+        echo "HUD 守护: 运行中 (pid $p)"
+    elif [ "$(get "$HUD_STATE/hud_enabled")" = "1" ]; then
+        echo "HUD 守护: 已启用但进程未运行"
+    else
+        echo "HUD 守护: 已关闭"
+    fi
+    echo "采样间隔: $(get "$HUD_STATE/hud_interval") 秒"
+    echo "通知开关: $(get "$HUD_STATE/hud_notify")"
+    echo "状态文件: $(get /data/local/tmp/kpad_hud.txt)"
+}
+
+cmd_hud_interval() {
+    local v="$1"
+    case "$v" in
+        ''|*[!0-9]*) echo "用法: cpuctl hud interval <秒, 1-60>"; return 1 ;;
+    esac
+    [ "$v" -lt 1 ] && v=1
+    [ "$v" -gt 60 ] && v=60
+    echo "$v" > "$HUD_STATE/hud_interval"
+    echo "采样间隔已设为 ${v} 秒"
+}
+
+cmd_hud_notify() {
+    local v="$1"
+    case "$v" in
+        on|1)  echo 1 > "$HUD_STATE/hud_notify"; echo "通知已开启" ;;
+        off|0) echo 0 > "$HUD_STATE/hud_notify"; echo "通知已关闭" ;;
+        *)     echo "用法: cpuctl hud notify <on|off>" ;;
+    esac
+}
+
+cmd_status() {
+    local prof id cs wm on=0 i=0 lim tgt eff note
+    prof=$(get "$STATE/profile"); [ -z "$prof" ] && prof=stock
+    echo "档位    : $prof"
+    for id in $CL_IDS; do
+        tgt=$(get "$STATE/tgt.p$id")
+        eff=$(get "$CFG/policy$id/scaling_max_freq")
+        note=""
+        if is_num "$tgt" && is_num "$eff" && [ "$eff" -lt "$tgt" ]; then
+            note="  ← 被系统限制(目标 $(ghz_khz "$tgt"))"
+        fi
+        printf "CPU %-5s: %7s - %7s kHz  now %7s  [%s]  %s%s\n" \
+            "$(cpus_span "$id")" \
+            "$(get "$CFG/policy$id/scaling_min_freq")" \
+            "$eff" \
+            "$(get "$CFG/policy$id/scaling_cur_freq")" \
+            "$(get "$CFG/policy$id/scaling_governor")" \
+            "$(cluster_name $i)" "$note"
+        i=$((i + 1))
+    done
+    local gc; gc=$(gpu_cur_mhz)
+    [ "$gc" = "0" ] && gc_txt="不可读(内核不暴露)" || gc_txt="${gc}MHz"
+    echo "GPU     : 档位 $(get "$GCDEV/cur_state")/$((GPU_N-1))  上限 $(gpu_freq_at "$(get "$GCDEV/cur_state")")MHz  当前 $gc_txt  占用 $(gpu_busy_pct)%  温度 $(fmt_t "$(gpu_temp)")"
+    echo "GPU设备 : ${GPU:-未找到}  ($(get "$GCDEV/type"))"
+    cs=$(core_state); wm=$(core_mask); i=0
+    while [ "$i" -lt "$NCPU" ]; do
+        [ "${cs:$i:1}" = "1" ] && on=$((on + 1))
+        i=$((i + 1))
+    done
+    if [ "$cs" = "$wm" ]; then
+        echo "核心    : $cs  在线 $on/$NCPU"
+    else
+        echo "核心    : $cs  在线 $on/$NCPU  目标 $wm"
+    fi
+    echo "温度    : CPU $(fmt_t "$(cpu_temp)")  电池 $(fmt_t "$(batt_temp)")"
+    echo "功耗    : $(batt_power)"
+    cmd_watch_status
+    lim=$(get "$STATE/temp_limit"); is_num "$lim" || lim=60000
+    echo "温度上限: $(fmt_t "$lim")"
+    [ "$(get "$STATE/throttled")" = "1" ] && echo "注意    : 已达温度上限, 暂时让权给系统温控"
+    cmd_web_status
+}
+
+cmd_list() {
+    local key n d lmin lmax mmin mmax bmin bmax gpup
+    printf "%-9s %-10s %-26s %s\n" "键" "名称" "三簇上限(占标称%)" "GPU"
+    profiles_dump | while IFS='|' read -r key n d lmin lmax mmin mmax bmin bmax gpup; do
+        printf "%-9s %-10s 小%-3s 中%-3s 大%-3s            %s\n" \
+            "$key" "$n" "$lmax" "$mmax" "$bmax" "$gpup"
+    done
+}
+
+cmd_info() {
+    local id i=0 ceil
+    echo "设备    : $(getprop ro.product.model) / $(getprop ro.product.device)"
+    echo "内核    : $(getprop ro.kernel.version)  $(getprop ro.build.version.release) (SDK $(getprop ro.build.version.sdk))"
+    echo "簇数    : $CL_N  ($CL_IDS)"
+    for id in $CL_IDS; do
+        ceil=$(cluster_ceiling "$id")
+        printf "  policy%-2s %-6s  cpu %-5s  %7s - %7s 系统上限 %7s kHz\n" \
+            "$id" "$(cluster_name $i)" "$(cpus_span "$id")" \
+            "$(cluster_min_freq "$id")" "$(cluster_hw_max "$id")" "$ceil"
+        i=$((i + 1))
+    done
+    echo "GPU     : $GPU  (${GPU_N} 档, 顶 $(gpu_top_mhz)MHz)"
+    echo "GPU温控 : $GCDEV (cur $(get "$GCDEV/cur_state") / max $(get "$GCDEV/max_state"))"
+    echo "状态目录: $STATE"
+    echo "模块目录: $MODDIR"
+}
+
+cmd_boot() {
+    local wait=${1:-20}
+    sleep "$wait"
+    rm -f "$STATE/web.pid"
+    rm -rf "$STATE/watch.lock"
+    detect_clusters
+    resolve_gpu
+    local prof
+    prof=$(get "$STATE/profile"); [ -z "$prof" ] && prof=stock
+    if [ "$prof" = "custom" ]; then
+        custom_apply
+    elif [ "$prof" != "stock" ]; then
+        profile_apply "$prof" >/dev/null 2>&1
+    fi
+    local gl; gl=$(get "$STATE/gpu_level")
+    is_num "$gl" && gpu_set_level "$gl"
+    core_enforce
+    if [ "$(get "$STATE/watch_enabled")" = "1" ]; then
+        sh "$MODDIR/bin/watch_run.sh" >/dev/null 2>&1
+    fi
+    [ -f "$STATE/web_disabled" ] || sh "$MODDIR/bin/web_spawn.sh" "$(web_port)" >/dev/null 2>&1
+    # 刷新率上限: 开机重新写一遍。Settings 库本身会持久化, 这里只是兜底 ——
+    # 万一被别的模块/服务改过, 开机仍回到用户上次用 cpuctl 设的值。
+    local rhz; rhz=$(get "$STATE/refresh_hz")
+    is_num "$rhz" && [ "$rhz" -gt 60 ] && cmd_refresh "$rhz" >/dev/null 2>&1
+    # 守护也跟着恢复(上次开着就继续开)
+    [ -f "$STATE/refresh_lock" ] && cmd_refresh lock on >/dev/null 2>&1
+}
+
+# ---------------- 入口 ----------------
+boot_guard
+detect_clusters
+resolve_gpu
+
+case "$1" in
+    status)  cmd_status ;;
+    list)    cmd_list ;;
+    info)    cmd_info ;;
+    apply)   cmd_apply "$2" ;;
+    set)     cmd_set "$2" "$3" "$4" ;;
+    setall)  shift; cmd_setall "$@" ;;
+    gpu)     cmd_gpu "$2" ;;
+    core)    cmd_core "$2" "$3" ;;
+    cores)   cmd_cores "$2" ;;
+    temp)    cmd_temp ;;
+    power)   cmd_power ;;
+    backup)  cmd_backup ;;
+    restore) cmd_apply stock ;;
+    hud)
+        case "$2" in
+            on)     cmd_hud_on ;;
+            off)    cmd_hud_off ;;
+            status|st) cmd_hud_status ;;
+            interval) cmd_hud_interval "$3" ;;
+            notify) cmd_hud_notify "$3" ;;
+            *)      echo "用法: cpuctl hud <on|off|status|interval <秒>|notify <on|off>>" ;;
+        esac ;;
+    watch)
+        case "$2" in
+            on)     cmd_watch_on ;;
+            off)    cmd_watch_off ;;
+            status|st) cmd_watch_status ;;
+            *)      echo "用法: cpuctl watch <on|off|status>" ;;
+        esac ;;
+    web)
+        case "$2" in
+            start)   cmd_web_start ;;
+            stop)    cmd_web_stop ;;
+            restart) cmd_web_stop >/dev/null; cmd_web_start ;;
+            status)  cmd_web_status ;;
+            open)    cmd_web_open ;;
+            *)       echo "用法: cpuctl web <start|stop|restart|status|open>" ;;
+        esac ;;
+    refresh) cmd_refresh "$2" "$3" ;;
+    boot)    cmd_boot 20 ;;
+    arm)     cmd_boot 1 ;;
+    __watch) cmd___watch ;;
+    *)
+        echo "kpad_cpuctl - REDMI K Pad (turner) 调频"
+        echo "  cpuctl info                      拓扑与系统上限探测"
+        echo "  cpuctl status                    查看状态"
+        echo "  cpuctl list                      列出档位"
+        echo "  cpuctl apply <档位>              切换档位"
+        echo "  cpuctl set <簇ID> <min> <max>    自定义单簇(kHz), 簇ID: $CL_IDS"
+        echo "  cpuctl setall <ID:min:max> ... [gpu档位]  多簇一起写"
+        echo "  cpuctl gpu <档位0-$((GPU_N-1))>   设置 GPU 频率档位"
+        echo "  cpuctl core <0-$((NCPU-1))> <on|off>     开关单个核心"
+        echo "  cpuctl cores [all|${NCPU}位掩码]          批量限核"
+        echo "  cpuctl hud <on|off|status>       状态栏 HUD(通知+悬浮窗)"
+        echo "  cpuctl hud interval <秒>         HUD 采样间隔(1-60, 默认5)"
+        echo "  cpuctl hud notify <on|off>       HUD 通知开关"
+        echo "  cpuctl watch <on|off|status>     自动维持"
+        echo "  cpuctl refresh [状态|48|60|90|120|144|165|auto]"
+        echo "                                   屏幕刷新率上限(本机面板 165Hz, 出厂压在 120)"
+        echo "  cpuctl refresh lock <on|off>     守护: 被系统改回时自动校正"
+        echo "  cpuctl temp | power              温度 / 功耗"
+        echo "  cpuctl backup | restore          备份 / 还原"
+        echo "  cpuctl web <start|stop|open>     图形界面"
+        echo "  cpuctl arm                       不等待, 立刻按保存的档位武装"
+        ;;
+esac
