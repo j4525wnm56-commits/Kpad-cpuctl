@@ -131,11 +131,14 @@ sample_freq() {
     if [ "$n" -ge 3 ]; then MID=${mid:-0}; else MID=0; fi
 }
 
-# 温度: 要读 21 个 zone。温度变化很慢(实测相邻 5s 差 0.1~1℃), 所以**每 30 秒读一次**,
-# 其余轮次沿用上次值(CT_HOLD)。配合 App 侧的中位数平滑, 显示完全不会跳。
-# 用累计秒数 tick 判定, 与 hud_interval 设置无关(间隔 1s 或 5s 都是准确的 30 秒)。
+# 温度: 要读 16 个 cpu zone。开销实测 1340µs/轮(全读) vs 400µs/轮(沿用), 而整轮已经 45ms,
+# 也就是说"省这一次读"只值 0.9ms(占空比 0.02%) —— 几乎白省。
+# 【v1.8.10 修·温度滞后】旧版 30 秒才读一次, 注释理由是"温度变化很慢(5s 差 0.1~1℃)",
+#   但那是**空载**下测的。实测(6 线程满载 6 秒): CPU 温度 25.6℃ -> 45.3℃, 单次跳 20℃。
+#   30s 间隔意味着负载起来后 HUD 会连续 6 轮显示 45℃ 以下, 读数直接失真。
+#   改成每轮都读(默认 5s), 用 0.9ms 换掉 20℃ 的显示误差。
 # TEMP_INTERVAL 可用环境变量覆盖; TEMP_FULL=1 强制每轮都读(仅测试用)。
-TEMP_INTERVAL=${TEMP_INTERVAL:-30}
+TEMP_INTERVAL=${TEMP_INTERVAL:-5}
 CT=0
 CT_HOLD=0
 sample_temp() {
@@ -439,6 +442,12 @@ sample_refresh() {
     #   只有该节点读不到时才退回面板上限(REF_MAX)兜底。
     CUR_REF=$REF
     if [ "$REF" = "0" ] && [ "$REF_MAX" -gt 0 ]; then REF=$REF_MAX; fi
+    # 【v1.8.10 修·刷新率卡旧值】REF_SHOWN 原来只在 sample_app_fps 走完那次昂贵的
+    #   SurfaceFlinger dump 之后才更新(该函数有 3 处提前 return, 大多数轮次根本到不了那一行)。
+    #   实测后果: 面板已经降到 50Hz, HUD 仍长时间显示 120Hz —— 用户看到的就是"数字不准"。
+    #   刷新率本身每轮都要读(260µs), 直接在源头跟随, 不再依赖下游分支是否执行。
+    #   "FPS/REF 同一时刻配对"的原始意图改由 sample() 里的 FPS<=REF 钳制来保证。
+    [ "$REF" -gt 0 ] && REF_SHOWN=$REF
     return 0
 }
 probe_fps_nodes
@@ -666,6 +675,12 @@ sample() {
     sample_app_fps     # SF 真实帧率: 内部按内核帧率决定是否真去 dump(235ms/次)
     # SF 值优先(它才是"应用真实渲染帧率"); 静止时 APP_FPS=0, 自然落回内核读数
     if [ "$APP_FPS" -gt 0 ]; then FPS=$APP_FPS; fi
+    # 【v1.8.10 修·帧率大于刷新率】APP_FPS 是 hold 值(上一轮 dump 算出, 最长可挂十几秒),
+    #   刷新率却是本轮实测。面板从 120Hz 掉到 50Hz 后, 会出现 "88/50Hz" 这种不可能的组合。
+    #   物理上渲染帧率不可能超过刷新率, 一旦超过就说明 FPS 是过期的 —— 归 0(界面显示 "-"),
+    #   比钳到刷新率诚实: 钳成 "50/50Hz" 会假装"刚好跑满"。
+    #   放在 sample() 里而不是 render_text(), 这样写状态文件的路径也能一起修掉。
+    if [ "$FPS" -gt 0 ] && [ "$REF" -gt 0 ] && [ "$FPS" -gt "$REF" ]; then FPS=0; fi
     return 0
 }
 

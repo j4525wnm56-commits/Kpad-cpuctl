@@ -1,7 +1,7 @@
 id=kpad_cpuctl
 name=K Pad 调频 (CPU+GPU)
-version=v1.3.0-hud
-versionCode=4
+version=v1.3.1-hud
+versionCode=5
 author=Langrm
-description=REDMI K Pad (turner / Dimensity 9400+) 的 CPU/GPU 频率档位管理。v1.3.0 解锁 165Hz: 本机面板支持 60/90/120/144/165, 但出厂把三个刷新率键都压在 120(system/peak_refresh_rate + secure/user_refresh_rate + secure/miui_refresh_rate, 少写一个会被另一个拉回去)。新增 cpuctl refresh 子命令: 可设 48~165 上限、查看 SF/面板当前值、auto 还原出厂; 附可选 refresh lock 守护(默认关闭): 开了就把上限锁死, 连你手动改的也顶回去, 适合"不想再被任何东西改回去"的场景; 不做无限拉锯, 60 秒内纠正超过 6 次即停手留标记。另修 service.sh 自启悬浮窗的类名错误(写成 $PKG/.HudService 会解析到不存在的类, 静默失败)。v1.2.0 的 HUD 重做(三簇/GPU上限标注/TEMP双槽/功率单位修复/fpsgo)全部保留。
+description=REDMI K Pad (turner / Dimensity 9400+) 的 CPU/GPU 频率档位管理。v1.3.1 修 HUD 三处读数不准: (1) 刷新率长期显示旧值 —— REF_SHOWN 原来只在跑完那次昂贵的 SurfaceFlinger dump 之后才更新, 该函数有 3 处提前 return, 实测面板已降到 50Hz 而界面仍挂在 120Hz; 改为在 sample_refresh 里每轮跟随 dynamic_fps(260µs, 可忽略)。(2) CPU 温度滞后 —— 原来 30 秒才读一次 zone, 但注释里"温度变化很慢"是空载下的结论, 实测 6 线程满载 6 秒即从 25.6℃ 跳到 45.3℃, 30 秒间隔会让界面连续 6 轮少报 20℃; 改为每轮读(全读仅 1.34ms, 而整轮已 45ms)。(3) 帧率可能大于刷新率 —— APP_FPS 是 hold 值, 面板从 120 掉到 50 后会出现 "88/50Hz"; 在 sample() 里加 FPS<=REF 钳制, 超过即归 0(显示 "-"), 比钳到刷新率诚实。v1.3.0 解锁 165Hz: 本机面板支持 60/90/120/144/165, 但出厂把三个刷新率键都压在 120(system/peak_refresh_rate + secure/user_refresh_rate + secure/miui_refresh_rate, 少写一个会被另一个拉回去)。新增 cpuctl refresh 子命令: 可设 48~165 上限、查看 SF/面板当前值、auto 还原出厂; 附可选 refresh lock 守护(默认关闭): 开了就把上限锁死, 连你手动改的也顶回去, 适合"不想再被任何东西改回去"的场景; 不做无限拉锯, 60 秒内纠正超过 6 次即停手留标记。另修 service.sh 自启悬浮窗的类名错误(写成 $PKG/.HudService 会解析到不存在的类, 静默失败)。v1.2.0 的 HUD 重做(三簇/GPU上限标注/TEMP双槽/功率单位修复/fpsgo)全部保留。
 updateJson=
